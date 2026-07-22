@@ -59,7 +59,8 @@ func TestActiveVUPoolRunning(t *testing.T) {
 }
 
 func BenchmarkActiveVUPoolDispatch(b *testing.B) {
-	workers := 16 * runtime.GOMAXPROCS(0)
+	// The sealed command pins four Ps, so this creates one concurrent pool worker per P.
+	workers := runtime.GOMAXPROCS(0)
 	state := newActiveVUPoolBenchmarkState(b)
 	pool := newActiveVUPool(state)
 	ctx := context.Background()
