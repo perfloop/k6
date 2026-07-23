@@ -494,7 +494,7 @@ func (varr RampingArrivalRate) Run(parentCtx context.Context, out chan<- metrics
 	timer := time.NewTimer(time.Hour)
 	start := time.Now()
 	batches := make(chan scheduleBatch)
-	batchReleased := make(chan struct{})
+	batchReleased := make(chan struct{}, 1)
 	var prevTime time.Duration
 	shownWarning := false
 	metricTags := varr.getMetricTags(nil)
@@ -507,13 +507,9 @@ func (varr RampingArrivalRate) Run(parentCtx context.Context, out chan<- metrics
 			default:
 			}
 			if i == batch.count-1 {
-				// The batch was sent by value, so cal can fill the next bounded batch
+				// The buffered acknowledgement lets cal fill the next bounded batch
 				// while Run waits for this timestamp.
-				select {
-				case <-maxDurationCtx.Done():
-					return nil
-				case batchReleased <- struct{}{}:
-				}
+				batchReleased <- struct{}{}
 			}
 			atomic.StoreInt64(&tickerPeriod, int64(nextTime-prevTime))
 			prevTime = nextTime
