@@ -17,7 +17,35 @@ import (
 	"go.k6.io/k6/v2/metrics"
 )
 
-const rampingArrivalRateType = "ramping-arrival-rate"
+const (
+	rampingArrivalRateType = "ramping-arrival-rate"
+	scheduleBatchSize      = 10
+)
+
+// scheduleBatch holds no more timestamps than the previous scheduler lookahead.
+type scheduleBatch struct {
+	times [scheduleBatchSize]time.Duration
+	count int
+}
+
+func (batch *scheduleBatch) send(
+	done <-chan struct{},
+	batches chan<- scheduleBatch,
+	batchReleased <-chan struct{},
+) bool {
+	select {
+	case <-done:
+		return false
+	case batches <- *batch:
+	}
+	select {
+	case <-done:
+		return false
+	case <-batchReleased:
+	}
+	batch.count = 0
+	return true
+}
 
 func init() {
 	lib.RegisterExecutorConfigType(
@@ -231,7 +259,12 @@ func (varr *RampingArrivalRate) Init(_ context.Context) error {
 // The specific implementation here can only go forward and does incorporate
 // the striping algorithm from the lib.ExecutionTuple for additional speed up but this could
 // possibly be refactored if need for this arises.
-func (varc RampingArrivalRateConfig) cal(ctx context.Context, et *lib.ExecutionTuple, ch chan<- time.Duration) {
+func (varc RampingArrivalRateConfig) cal(
+	ctx context.Context,
+	et *lib.ExecutionTuple,
+	batches chan<- scheduleBatch,
+	batchReleased <-chan struct{},
+) {
 	start, offsets, _ := et.GetStripedOffsets()
 	li := -1
 	// TODO: move this to a utility function, or directly what GetStripedOffsets uses once we see everywhere we will use it
@@ -239,15 +272,16 @@ func (varc RampingArrivalRateConfig) cal(ctx context.Context, et *lib.ExecutionT
 		li++
 		return offsets[li%len(offsets)]
 	}
-	defer close(ch) // TODO: maybe this is not a good design - closing a channel we get
+	defer close(batches)
 	var (
 		stageStart                   time.Duration
 		timeUnit                     = float64(varc.TimeUnit.Duration)
 		doneSoFar, endCount, to, dur float64
 		from                         = float64(varc.StartRate.ValueOrZero()) / timeUnit
 		// start .. starts at 0 but the algorithm works with area so we need to start from 1 not 0
-		i    = float64(start + 1)
-		done = ctx.Done()
+		i     = float64(start + 1)
+		done  = ctx.Done()
+		batch scheduleBatch
 	)
 
 	for _, stage := range varc.Stages {
@@ -256,14 +290,18 @@ func (varc RampingArrivalRateConfig) cal(ctx context.Context, et *lib.ExecutionT
 		if from != to { // ramp up/down
 			endCount += dur * ((to-from)/2 + from)
 			for ; i <= endCount; i += float64(next()) {
-				// TODO: try to twist this in a way to be able to get i (the only changing part)
-				// somewhere where it is less in the middle of the equation
-				x := (from*dur - noNegativeSqrt(dur*(from*from*dur+2*(i-doneSoFar)*(to-from)))) / (from - to)
-
 				select {
 				case <-done:
 					return
-				case ch <- time.Duration(x) + stageStart:
+				default:
+				}
+				// TODO: try to twist this in a way to be able to get i (the only changing part)
+				// somewhere where it is less in the middle of the equation
+				x := (from*dur - noNegativeSqrt(dur*(from*from*dur+2*(i-doneSoFar)*(to-from)))) / (from - to)
+				batch.times[batch.count] = time.Duration(x) + stageStart
+				batch.count++
+				if batch.count == len(batch.times) && !batch.send(done, batches, batchReleased) {
+					return
 				}
 			}
 		} else {
@@ -272,13 +310,21 @@ func (varc RampingArrivalRateConfig) cal(ctx context.Context, et *lib.ExecutionT
 				select {
 				case <-done:
 					return
-				case ch <- time.Duration((i-doneSoFar)/to) + stageStart:
+				default:
+				}
+				batch.times[batch.count] = time.Duration((i-doneSoFar)/to) + stageStart
+				batch.count++
+				if batch.count == len(batch.times) && !batch.send(done, batches, batchReleased) {
+					return
 				}
 			}
 		}
 		doneSoFar = endCount
 		from = to
 		stageStart += stage.Duration.TimeDuration()
+	}
+	if batch.count != 0 && !batch.send(done, batches, batchReleased) {
+		return
 	}
 }
 
@@ -447,58 +493,70 @@ func (varr RampingArrivalRate) Run(parentCtx context.Context, out chan<- metrics
 	regDurationDone := regDurationCtx.Done()
 	timer := time.NewTimer(time.Hour)
 	start := time.Now()
-	ch := make(chan time.Duration, 10) // buffer 10 iteration times ahead
+	batches := make(chan scheduleBatch)
+	batchReleased := make(chan struct{})
 	var prevTime time.Duration
 	shownWarning := false
 	metricTags := varr.getMetricTags(nil)
-	go varr.config.cal(maxDurationCtx, varr.et, ch)
-	for nextTime := range ch {
-		select {
-		case <-regDurationDone:
-			return nil
-		default:
-		}
-		atomic.StoreInt64(&tickerPeriod, int64(nextTime-prevTime))
-		prevTime = nextTime
-		b := time.Until(start.Add(nextTime))
-		if b > 0 { // TODO: have a minimal ?
-			timer.Reset(b)
+	go varr.config.cal(maxDurationCtx, varr.et, batches, batchReleased)
+	for batch := range batches {
+		for i, nextTime := range batch.times[:batch.count] {
 			select {
-			case <-timer.C:
 			case <-regDurationDone:
 				return nil
+			default:
 			}
-		}
-
-		if vusPool.TryRunIteration() {
-			continue
-		}
-
-		// Since there aren't any free VUs available, consider this iteration
-		// dropped - we aren't going to try to recover it, but
-		metrics.PushIfNotDone(parentCtx, out, metrics.Sample{
-			TimeSeries: metrics.TimeSeries{
-				Metric: varr.executionState.Test.BuiltinMetrics.DroppedIterations,
-				Tags:   metricTags,
-			},
-			Time:  time.Now(),
-			Value: 1,
-		})
-
-		// We'll try to start allocating another VU in the background,
-		// non-blockingly, if we have remainingUnplannedVUs...
-		if remainingUnplannedVUs == 0 {
-			if !shownWarning {
-				varr.logger.Warningf("Insufficient VUs, reached %d active VUs and cannot initialize more", maxVUs)
-				shownWarning = true
+			if i == batch.count-1 {
+				// The batch was sent by value, so cal can fill the next bounded batch
+				// while Run waits for this timestamp.
+				select {
+				case <-maxDurationCtx.Done():
+					return nil
+				case batchReleased <- struct{}{}:
+				}
 			}
-			continue
-		}
+			atomic.StoreInt64(&tickerPeriod, int64(nextTime-prevTime))
+			prevTime = nextTime
+			b := time.Until(start.Add(nextTime))
+			if b > 0 { // TODO: have a minimal ?
+				timer.Reset(b)
+				select {
+				case <-timer.C:
+				case <-regDurationDone:
+					return nil
+				}
+			}
 
-		select {
-		case makeUnplannedVUCh <- struct{}{}: // great!
-			remainingUnplannedVUs--
-		default: // we're already allocating a new VU
+			if vusPool.TryRunIteration() {
+				continue
+			}
+
+			// Since there aren't any free VUs available, consider this iteration
+			// dropped - we aren't going to try to recover it, but
+			metrics.PushIfNotDone(parentCtx, out, metrics.Sample{
+				TimeSeries: metrics.TimeSeries{
+					Metric: varr.executionState.Test.BuiltinMetrics.DroppedIterations,
+					Tags:   metricTags,
+				},
+				Time:  time.Now(),
+				Value: 1,
+			})
+
+			// We'll try to start allocating another VU in the background,
+			// non-blockingly, if we have remainingUnplannedVUs...
+			if remainingUnplannedVUs == 0 {
+				if !shownWarning {
+					varr.logger.Warningf("Insufficient VUs, reached %d active VUs and cannot initialize more", maxVUs)
+					shownWarning = true
+				}
+				continue
+			}
+
+			select {
+			case makeUnplannedVUCh <- struct{}{}: // great!
+				remainingUnplannedVUs--
+			default: // we're already allocating a new VU
+			}
 		}
 	}
 	return nil

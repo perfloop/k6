@@ -436,11 +436,13 @@ func TestRampingArrivalRateCal(t *testing.T) {
 
 		t.Run(fmt.Sprintf("testNum %d - %s timeunit %s", testNum, et, config.TimeUnit), func(t *testing.T) {
 			t.Parallel()
-			ch := make(chan time.Duration)
-			go config.cal(t.Context(), et, ch)
+			batches := make(chan scheduleBatch)
+			batchReleased := make(chan struct{})
+			go config.cal(t.Context(), et, batches, batchReleased)
 			changes := make([]time.Duration, 0, len(expectedTimes))
-			for c := range ch {
-				changes = append(changes, c)
+			for batch := range batches {
+				changes = append(changes, batch.times[:batch.count]...)
+				batchReleased <- struct{}{}
 			}
 			assert.Equal(t, len(expectedTimes), len(changes))
 			for i, expectedTime := range expectedTimes {
@@ -450,6 +452,36 @@ func TestRampingArrivalRateCal(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRampingArrivalRateCalBatches(t *testing.T) {
+	t.Parallel()
+
+	config := RampingArrivalRateConfig{
+		TimeUnit:  types.NullDurationFrom(time.Second),
+		StartRate: null.IntFrom(1000),
+		Stages: []Stage{{
+			Duration: types.NullDurationFrom(25 * time.Millisecond),
+			Target:   null.IntFrom(1000),
+		}},
+	}
+	batches := make(chan scheduleBatch)
+	batchReleased := make(chan struct{})
+	go config.cal(t.Context(), mustNewExecutionTuple(nil, nil), batches, batchReleased)
+
+	var (
+		batchSizes []int
+		previous   time.Duration
+	)
+	for batch := range batches {
+		batchSizes = append(batchSizes, batch.count)
+		for _, nextTime := range batch.times[:batch.count] {
+			assert.Greater(t, nextTime, previous)
+			previous = nextTime
+		}
+		batchReleased <- struct{}{}
+	}
+	require.Equal(t, []int{scheduleBatchSize, scheduleBatchSize, 5}, batchSizes)
 }
 
 func BenchmarkCal(b *testing.B) {
@@ -476,10 +508,14 @@ func BenchmarkCal(b *testing.B) {
 			b.ResetTimer()
 			b.RunParallel(func(pb *testing.PB) {
 				for pb.Next() {
-					ch := make(chan time.Duration, 20)
-					go config.cal(b.Context(), et, ch)
-					for c := range ch {
-						_ = c
+					batches := make(chan scheduleBatch)
+					batchReleased := make(chan struct{})
+					go config.cal(b.Context(), et, batches, batchReleased)
+					for batch := range batches {
+						for _, nextTime := range batch.times[:batch.count] {
+							_ = nextTime
+						}
+						batchReleased <- struct{}{}
 					}
 				}
 			})
@@ -573,17 +609,21 @@ func TestCompareCalImplementation(t *testing.T) {
 
 	et := mustNewExecutionTuple(nil, nil)
 	chRat := make(chan time.Duration, 20)
-	ch := make(chan time.Duration, 20)
+	batches := make(chan scheduleBatch)
+	batchReleased := make(chan struct{})
 	go config.calRat(et, chRat)
-	go config.cal(t.Context(), et, ch)
+	go config.cal(t.Context(), et, batches, batchReleased)
 	count := 0
 	var diff int
-	for c := range ch {
-		count++
-		cRat := <-chRat
-		if !assert.InDelta(t, c, cRat, 1, "%d", count) {
-			diff++
+	for batch := range batches {
+		for _, c := range batch.times[:batch.count] {
+			count++
+			cRat := <-chRat
+			if !assert.InDelta(t, c, cRat, 1, "%d", count) {
+				diff++
+			}
 		}
+		batchReleased <- struct{}{}
 	}
 	require.Equal(t, 0, diff)
 }
