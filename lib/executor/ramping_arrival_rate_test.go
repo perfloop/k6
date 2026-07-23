@@ -437,12 +437,10 @@ func TestRampingArrivalRateCal(t *testing.T) {
 		t.Run(fmt.Sprintf("testNum %d - %s timeunit %s", testNum, et, config.TimeUnit), func(t *testing.T) {
 			t.Parallel()
 			batches := make(chan scheduleBatch)
-			batchReleased := make(chan struct{})
-			go config.cal(t.Context(), et, batches, batchReleased)
+			go config.cal(t.Context(), et, batches)
 			changes := make([]time.Duration, 0, len(expectedTimes))
 			for batch := range batches {
 				changes = append(changes, batch.times[:batch.count]...)
-				batchReleased <- struct{}{}
 			}
 			assert.Equal(t, len(expectedTimes), len(changes))
 			for i, expectedTime := range expectedTimes {
@@ -461,13 +459,12 @@ func TestRampingArrivalRateCalBatches(t *testing.T) {
 		TimeUnit:  types.NullDurationFrom(time.Second),
 		StartRate: null.IntFrom(1000),
 		Stages: []Stage{{
-			Duration: types.NullDurationFrom(25 * time.Millisecond),
+			Duration: types.NullDurationFrom(12 * time.Millisecond),
 			Target:   null.IntFrom(1000),
 		}},
 	}
 	batches := make(chan scheduleBatch)
-	batchReleased := make(chan struct{})
-	go config.cal(t.Context(), mustNewExecutionTuple(nil, nil), batches, batchReleased)
+	go config.cal(t.Context(), mustNewExecutionTuple(nil, nil), batches)
 
 	var (
 		batchSizes []int
@@ -479,9 +476,8 @@ func TestRampingArrivalRateCalBatches(t *testing.T) {
 			assert.Greater(t, nextTime, previous)
 			previous = nextTime
 		}
-		batchReleased <- struct{}{}
 	}
-	require.Equal(t, []int{scheduleBatchSize, scheduleBatchSize, 5}, batchSizes)
+	require.Equal(t, []int{scheduleBatchSize, scheduleBatchSize, 2}, batchSizes)
 }
 
 func BenchmarkCal(b *testing.B) {
@@ -509,13 +505,11 @@ func BenchmarkCal(b *testing.B) {
 			b.RunParallel(func(pb *testing.PB) {
 				for pb.Next() {
 					batches := make(chan scheduleBatch)
-					batchReleased := make(chan struct{})
-					go config.cal(b.Context(), et, batches, batchReleased)
+					go config.cal(b.Context(), et, batches)
 					for batch := range batches {
-						for _, nextTime := range batch.times[:batch.count] {
-							_ = nextTime
+						if batch.count == 0 {
+							b.Fatal("received an empty schedule batch")
 						}
-						batchReleased <- struct{}{}
 					}
 				}
 			})
@@ -610,9 +604,8 @@ func TestCompareCalImplementation(t *testing.T) {
 	et := mustNewExecutionTuple(nil, nil)
 	chRat := make(chan time.Duration, 20)
 	batches := make(chan scheduleBatch)
-	batchReleased := make(chan struct{})
 	go config.calRat(et, chRat)
-	go config.cal(t.Context(), et, batches, batchReleased)
+	go config.cal(t.Context(), et, batches)
 	count := 0
 	var diff int
 	for batch := range batches {
@@ -623,7 +616,6 @@ func TestCompareCalImplementation(t *testing.T) {
 				diff++
 			}
 		}
-		batchReleased <- struct{}{}
 	}
 	require.Equal(t, 0, diff)
 }

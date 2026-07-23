@@ -19,29 +19,22 @@ import (
 
 const (
 	rampingArrivalRateType = "ramping-arrival-rate"
-	scheduleBatchSize      = 10
+	// scheduleBatchSize allows one batch in Run and one in cal while retaining
+	// the previous ten-timestamp lookahead.
+	scheduleBatchSize = 5
 )
 
-// scheduleBatch holds no more timestamps than the previous scheduler lookahead.
+// scheduleBatch is passed by value from cal to Run.
 type scheduleBatch struct {
 	times [scheduleBatchSize]time.Duration
 	count int
 }
 
-func (batch *scheduleBatch) send(
-	done <-chan struct{},
-	batches chan<- scheduleBatch,
-	batchReleased <-chan struct{},
-) bool {
+func (batch *scheduleBatch) send(done <-chan struct{}, batches chan<- scheduleBatch) bool {
 	select {
 	case <-done:
 		return false
 	case batches <- *batch:
-	}
-	select {
-	case <-done:
-		return false
-	case <-batchReleased:
 	}
 	batch.count = 0
 	return true
@@ -263,7 +256,6 @@ func (varc RampingArrivalRateConfig) cal(
 	ctx context.Context,
 	et *lib.ExecutionTuple,
 	batches chan<- scheduleBatch,
-	batchReleased <-chan struct{},
 ) {
 	start, offsets, _ := et.GetStripedOffsets()
 	li := -1
@@ -300,7 +292,7 @@ func (varc RampingArrivalRateConfig) cal(
 				x := (from*dur - noNegativeSqrt(dur*(from*from*dur+2*(i-doneSoFar)*(to-from)))) / (from - to)
 				batch.times[batch.count] = time.Duration(x) + stageStart
 				batch.count++
-				if batch.count == len(batch.times) && !batch.send(done, batches, batchReleased) {
+				if batch.count == len(batch.times) && !batch.send(done, batches) {
 					return
 				}
 			}
@@ -314,7 +306,7 @@ func (varc RampingArrivalRateConfig) cal(
 				}
 				batch.times[batch.count] = time.Duration((i-doneSoFar)/to) + stageStart
 				batch.count++
-				if batch.count == len(batch.times) && !batch.send(done, batches, batchReleased) {
+				if batch.count == len(batch.times) && !batch.send(done, batches) {
 					return
 				}
 			}
@@ -323,8 +315,8 @@ func (varc RampingArrivalRateConfig) cal(
 		from = to
 		stageStart += stage.Duration.TimeDuration()
 	}
-	if batch.count != 0 && !batch.send(done, batches, batchReleased) {
-		return
+	if batch.count != 0 {
+		batch.send(done, batches)
 	}
 }
 
@@ -494,26 +486,16 @@ func (varr RampingArrivalRate) Run(parentCtx context.Context, out chan<- metrics
 	timer := time.NewTimer(time.Hour)
 	start := time.Now()
 	batches := make(chan scheduleBatch)
-	batchReleased := make(chan struct{})
 	var prevTime time.Duration
 	shownWarning := false
 	metricTags := varr.getMetricTags(nil)
-	go varr.config.cal(maxDurationCtx, varr.et, batches, batchReleased)
+	go varr.config.cal(maxDurationCtx, varr.et, batches)
 	for batch := range batches {
-		for i, nextTime := range batch.times[:batch.count] {
+		for _, nextTime := range batch.times[:batch.count] {
 			select {
 			case <-regDurationDone:
 				return nil
 			default:
-			}
-			if i == batch.count-1 {
-				// The batch was sent by value, so cal can fill the next bounded batch
-				// while Run waits for this timestamp.
-				select {
-				case <-maxDurationCtx.Done():
-					return nil
-				case batchReleased <- struct{}{}:
-				}
 			}
 			atomic.StoreInt64(&tickerPeriod, int64(nextTime-prevTime))
 			prevTime = nextTime
